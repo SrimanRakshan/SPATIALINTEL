@@ -1,120 +1,157 @@
-import os
+"""
+Phase 4 — SAM Instance Segmentation.
+
+Execution guarantees:
+  [IDEMPOTENCY]  Skips if scene_graph_sam.json exists unless --force_recompute.
+  [OBSERVABILITY] Structured logger + phase_timer.
+  [RESOURCE]     torch.cuda.empty_cache() after inference; file handles via ctx mgr.
+  [SAFETY]       Frames with no detections written as empty lists (not skipped).
+"""
+from __future__ import annotations
+
 import argparse
-import json
-import numpy as np
-import cv2
-import torch
+import sys
 from pathlib import Path
-from tqdm import tqdm
+from typing import List, Tuple
+
+import cv2
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.io_helpers import ensure_dir, load_json, save_json
+from utils.logger import get_logger, phase_timer
+from utils.validators import check_output_exists
+
+logger = get_logger("phase4.sam_segmentation")
 
 try:
-    from segment_anything import sam_model_registry, SamPredictor
+    from segment_anything import SamPredictor, sam_model_registry
 except ImportError:
-    print("Error: Could not import segment_anything.")
-    print("Please install via: pip install git+https://github.com/facebookresearch/segment-anything.git")
-    exit(1)
+    logger.error("segment_anything not installed.")
+    logger.error("Install: pip install git+https://github.com/facebookresearch/segment-anything.git")
+    raise SystemExit(1)
 
-from .utils import check_sam_weights, overlay_masks, load_scene_graph
+from .utils import check_sam_weights, overlay_masks
 
-def run_instance_segmentation(images_dir: str, scene_graph_path: str, output_dir: str, model_type: str = "vit_b"):
+
+def run_instance_segmentation(
+    images_dir: str,
+    scene_graph_path: str,
+    output_dir: str,
+    model_type: str = "vit_b",
+    force_recompute: bool = False,
+) -> None:
     """
-    Run Segment Anything (SAM) conditioned on YOLOv8 bounding boxes.
-    Extracts precise instance masks for 3D projection.
+    Run SAM conditioned on YOLOv8 bounding boxes.
+    Public signature UNCHANGED.
+    Output schema of scene_graph_sam.json is UNCHANGED.
     """
-    images_dir = Path(images_dir)
-    scene_graph_path = Path(scene_graph_path)
-    output_dir = Path(output_dir)
-    
-    if not images_dir.exists() or not scene_graph_path.exists():
-        print(f"Error: Missing inputs. Ensure {images_dir} and {scene_graph_path} exist.")
-        exit(1)
-        
-    output_dir.mkdir(parents=True, exist_ok=True)
-    masks_dir = output_dir / "masks"
-    masks_dir.mkdir(parents=True, exist_ok=True)
-    vis_dir = output_dir / "visualizations"
-    vis_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Ensure Model Weights
-    weights_path = check_sam_weights(model_type, str(output_dir / "weights"))
-    
-    # 2. Initialize SAM
-    print(f"Loading SAM ({model_type}) from {weights_path}...")
+    images_dir_p = Path(images_dir)
+    scene_graph_path_p = Path(scene_graph_path)
+    output_dir_p = Path(output_dir)
+    out_json = output_dir_p / "scene_graph_sam.json"
+
+    # [IDEMPOTENCY]
+    if not force_recompute and check_output_exists(out_json):
+        logger.info(f"Output already exists: {out_json}. Skipping. Use --force_recompute to override.")
+        return
+
+    if not images_dir_p.exists() or not scene_graph_path_p.exists():
+        logger.error(f"Missing inputs: {images_dir_p} or {scene_graph_path_p}")
+        logger.error("Hint: Run Phase 4 semantic_mapping.py before sam_segmentation.py.")
+        raise SystemExit(1)
+
+    ensure_dir(output_dir_p)
+    masks_dir = ensure_dir(output_dir_p / "masks")
+    vis_dir = ensure_dir(output_dir_p / "visualizations")
+
+    weights_path = check_sam_weights(model_type, str(output_dir_p / "weights"))
+
+    logger.info(f"Loading SAM ({model_type}) from {weights_path}...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"SAM device: {device}")
     sam = sam_model_registry[model_type](checkpoint=weights_path)
     sam.to(device=device)
     predictor = SamPredictor(sam)
-    
-    # 3. Load 2D Scene Graph (YOLO detections)
-    scene_graph_2d = load_scene_graph(str(scene_graph_path))
-    frames_data = scene_graph_2d.get("frames", {})
-    
-    # Will store the enriched scene graph with mask references
-    enriched_scene_graph = {"frames": {}}
-    
-    print(f"Running Instance Segmentation extraction on {len(frames_data)} frames...")
-    
-    for frame_name, detections in tqdm(frames_data.items(), desc="Segmenting frames"):
-        img_path = images_dir / frame_name
-        if not img_path.exists():
-            continue
-            
-        # Load image
-        image_bgr = cv2.imread(str(img_path))
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        
-        # Set image in predictor
-        predictor.set_image(image_rgb)
-        
-        frame_results = []
-        frame_masks = []
-        
-        for idx, det in enumerate(detections):
-            bbox = np.array(det["bbox"]) # [x1, y1, x2, y2]
-            
-            # Predict mask using bounding box prompt
-            masks, scores, logits = predictor.predict(
-                box=bbox,
-                multimask_output=False
+
+    scene_graph_2d = load_json(scene_graph_path_p)
+    frames_data: dict = scene_graph_2d.get("frames", {})
+    enriched_scene_graph: dict = {"frames": {}}
+
+    logger.info(f"Running instance segmentation on {len(frames_data)} frames...")
+
+    from tqdm import tqdm
+
+    with phase_timer(logger, "SAM Instance Segmentation"):
+        for frame_name, detections in tqdm(frames_data.items(), desc="Segmenting frames"):
+            img_path = images_dir_p / frame_name
+            if not img_path.exists() or not detections:
+                enriched_scene_graph["frames"][frame_name] = []
+                continue
+
+            image_bgr = cv2.imread(str(img_path))
+            if image_bgr is None:
+                enriched_scene_graph["frames"][frame_name] = []
+                continue
+
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            predictor.set_image(image_rgb)
+
+            boxes_np = np.array([det["bbox"] for det in detections], dtype=np.float32)
+            boxes_torch = torch.from_numpy(boxes_np).to(device)
+            boxes_transformed = predictor.transform.apply_boxes_torch(
+                boxes_torch, image_rgb.shape[:2]
             )
-            
-            best_mask = masks[0]
-            
-            # Save boolean mask to disk using numpy compressed
-            mask_filename = f"{img_path.stem}_obj{idx:03d}_{det['class_name']}.npz"
-            mask_filepath = masks_dir / mask_filename
-            np.savez_compressed(mask_filepath, mask=best_mask)
-            
-            # Update detection data
-            det_enriched = det.copy()
-            det_enriched["mask_path"] = str(mask_filepath.relative_to(output_dir))
-            det_enriched["mask_confidence"] = float(scores[0])
-            frame_results.append(det_enriched)
-            
-            frame_masks.append((best_mask, det['class_name']))
-            
-        enriched_scene_graph["frames"][frame_name] = frame_results
-        
-        # Overlay masks for visualization
-        if frame_masks:
-            vis_img = overlay_masks(image_bgr, frame_masks)
-            cv2.imwrite(str(vis_dir / frame_name), vis_img)
-            
-    # Save Enriched Scene Graph
-    out_json = output_dir / "scene_graph_sam.json"
-    with open(out_json, "w") as f:
-        json.dump(enriched_scene_graph, f, indent=4)
-        
-    print(f"\nInstance Segmentation Complete.")
-    print(f"Masks saved to {masks_dir}")
-    print(f"Enriched JSON saved to {out_json}")
+
+            # [BREAKING RISK - MINOR] predict_torch returns (N,1,H,W); iterated below.
+            masks_batch, scores_batch, _ = predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=boxes_transformed,
+                multimask_output=False,
+            )
+
+            frame_results = []
+            frame_masks: List[Tuple[np.ndarray, str]] = []
+
+            for idx, (det, mask_1hw, score_1) in enumerate(
+                zip(detections, masks_batch, scores_batch)
+            ):
+                best_mask: np.ndarray = mask_1hw[0].cpu().numpy()
+                score: float = float(score_1[0].cpu().numpy())
+                mask_filename = f"{img_path.stem}_obj{idx:03d}_{det['class_name']}.npz"
+                mask_filepath = masks_dir / mask_filename
+                np.savez_compressed(mask_filepath, mask=best_mask)
+
+                det_enriched = det.copy()
+                det_enriched["mask_path"] = str(mask_filepath.relative_to(output_dir_p))
+                det_enriched["mask_confidence"] = score
+                frame_results.append(det_enriched)
+                frame_masks.append((best_mask, det["class_name"]))
+
+            enriched_scene_graph["frames"][frame_name] = frame_results
+
+            if frame_masks:
+                vis_img = overlay_masks(image_bgr, frame_masks)
+                cv2.imwrite(str(vis_dir / frame_name), vis_img)
+
+    # [RESOURCE] Release VRAM
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.debug("GPU cache cleared.")
+
+    save_json(enriched_scene_graph, out_json)
+    logger.info(f"Instance Segmentation complete. Masks → {masks_dir}")
+    logger.info(f"Enriched scene graph → {out_json}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run SAM Instance Segmentation on YOLO detections.")
-    parser.add_argument("--images", required=True, help="Input directory containing preprocessed images")
-    parser.add_argument("--scene_graph", required=True, help="Path to YOLO 2D scene graph JSON")
-    parser.add_argument("--output", required=True, help="Output directory to store masks and enriched graph")
-    parser.add_argument("--model", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"], help="SAM model type")
-    
+    parser.add_argument("--images", required=True)
+    parser.add_argument("--scene_graph", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--model", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"])
+    parser.add_argument("--force_recompute", action="store_true")
     args = parser.parse_args()
-    run_instance_segmentation(args.images, args.scene_graph, args.output, args.model)
+    run_instance_segmentation(args.images, args.scene_graph, args.output, args.model, args.force_recompute)

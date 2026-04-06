@@ -1,8 +1,7 @@
 # 🧠 Python & General
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*.so
 
 # 🌱 Virtual Environments
 .venv/
@@ -31,30 +30,57 @@ dist/
 .vscode/
 .idea/
 
-# 🧾 Logs
+# 🧾 Logs (KEEP folder, ignore contents)
+logs/
 *.log
 
-# 🧠 ML / CV / 3D Data (IMPORTANT)
+# 📦 Large Data & Outputs
 data/
 outputs/
+
+# 🎥 Media & Large Files
 *.mp4
+*.avi
+*.mov
+
+# Images (ignore heavy ones)
 *.jpg
+*.jpeg
 *.png
-*.npz
+
+# 🧠 ML / DL Models
 *.pth
 *.pt
 *.ckpt
+*.onnx
+
+# 🧠 Scientific / CV Data
+*.npz
+*.npy
 *.bin
 *.db
-*.ply
-*.txt
 
-# ⚙️ NeRF / COLMAP / Nerfstudio
-nerfstudio/
+# 🧊 3D / Geometry Files
+*.ply
+*.obj
+*.mtl
+
+# ⚙️ NeRF / COLMAP Artifacts
 colmap/
 sparse/
 dense/
+nerfstudio/
+arts/
 
 # 🧹 OS Junk
 .DS_Store
 Thumbs.db
+
+# ⚠️ KEEP IMPORTANT FILES
+!README.md
+!requirements.txt
+!*.md
+
+# Optional: keep sample images if needed
+#!data/sample/
+#!outputs/sample/

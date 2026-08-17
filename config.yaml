@@ -1,0 +1,72 @@
+# ============================================================
+# SPATIALINTEL — Centralized Pipeline Configuration
+# ============================================================
+# All magic numbers and configurable paths live here.
+# Individual phase scripts read from this file via load_config().
+
+pipeline:
+  input_video: "data/scenes/scene_001/video.mp4"
+  output_base: "outputs"
+  scene_id: "scene_001"
+
+# ----------------------------------------------------------
+# Phase 1 — Frame Extraction & Subsampling
+# ----------------------------------------------------------
+phase1:
+  frame_interval: 5           # Extract 1 frame every N frames
+  blur_threshold: 100.0       # Laplacian variance below this = blurry (skip)
+  ssim_threshold: 0.95        # SSIM above this = near-duplicate (skip)
+  target_width: -1            # Resize width (-1 = keep original)
+  target_height: -1           # Resize height (-1 = keep original)
+  equalize: false             # Apply CLAHE histogram equalisation
+  num_workers: 4              # ThreadPoolExecutor workers for parallel blur scoring
+
+# ----------------------------------------------------------
+# Phase 2 — COLMAP Sparse Reconstruction
+# ----------------------------------------------------------
+phase2:
+  camera_model: "PINHOLE"
+  single_camera: true         # Assume single shared camera for all frames
+
+# ----------------------------------------------------------
+# Phase 3 — NeRF / Splatfacto Training
+# ----------------------------------------------------------
+phase3:
+  model: "nerfacto"           # "nerfacto" or "splatfacto"
+  train_num_rays_per_batch: 2048
+  eval_num_rays_per_chunk: 2048
+  resume_if_checkpoint_exists: true
+  cuda_visible_devices: "0"
+  pytorch_alloc_conf: "max_split_size_mb:512"
+
+# ----------------------------------------------------------
+# Phase 4 — Semantic Mapping (YOLOv8 + SAM)
+# ----------------------------------------------------------
+phase4:
+  yolo_model: "yolov8n.pt"   # yolov8n / yolov8s / yolov8m / yolov8l / yolov8x
+  yolo_confidence: 0.25
+  yolo_batch_size: 8          # Images per YOLO forward pass (GPU batching)
+  sam_model_type: "vit_b"     # vit_b / vit_l / vit_h
+  use_fp16: true              # fp16 inference if CUDA available (CPU fallback)
+
+# ----------------------------------------------------------
+# Phase 5 — Spatial LLM Agent
+# ----------------------------------------------------------
+phase5:
+  llm_provider: "gemini"      # gemini / openai / huggingface
+  top_k_objects: 50           # Max objects injected into LLM context prompt
+
+# ----------------------------------------------------------
+# Visualization & Streamlit
+# ----------------------------------------------------------
+visualization:
+  max_points: 50000           # Plotly 3D scatter point cap (prevents WebGL crash)
+  distance_threshold: 7.0     # Max distance (m) for topology graph edges
+  pcd_points_per_object: 800  # Points per semantic sphere in Plotly view
+
+# ----------------------------------------------------------
+# GPU
+# ----------------------------------------------------------
+gpu:
+  device_index: 0
+  use_fp16: true              # Global fp16 toggle; per-phase overrides take precedence

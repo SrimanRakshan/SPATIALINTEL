@@ -1,55 +1,69 @@
+"""
+Evaluation — 3D Mesh Export.
+
+Execution guarantees:
+  [IDEMPOTENCY]  Skips if output_dir already has .ply unless --force_recompute.
+  [OBSERVABILITY] Structured logger + phase_timer.
+  [SAFETY]       Windows patches preserved via build_nerf_runner.
+"""
+from __future__ import annotations
+
 import argparse
-import subprocess
-import os
 import sys
+from pathlib import Path
 
-def run_cmd(cmd: list, desc: str):
-    print(f"\n--- {desc} ---")
-    print(f"Running: {' '.join(cmd)}")
-    
-    # Use the same monkeypatch wrapper we used for the video render
-    # to avoid compatibility issues with PyTorch weights and OS environment bugs.
-    runner = (
-        "import sys, torch, warnings, os, subprocess; "
-        "old_popen = subprocess.Popen; "
-        "subprocess.Popen = lambda *a, **k: old_popen(*a, **{**k, 'env': None} if k.get('env') == {} else k); "
-        "os.environ['TORCH_FORCE_WEIGHTS_ONLY_LOAD'] = '0'; "
-        "sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None; "
-        "warnings.filterwarnings('ignore', category=FutureWarning); "
-        "_old_load = torch.load; "
-        "torch.load = lambda *a, **k: _old_load(*a, **{**k, 'weights_only': False}); "
-        "from nerfstudio.scripts.exporter import entrypoint; "
-        "sys.argv=sys.argv[1:]; "
-        "entrypoint()"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.subprocess_runner import build_nerf_runner, run_cmd
+from utils.logger import get_logger, phase_timer
+
+logger = get_logger("evaluation.export_mesh")
+
+
+def export_3d_mesh(
+    config_path: str,
+    output_dir: str,
+    method: str = "tsdf",
+    force_recompute: bool = False,
+) -> None:
+    """
+    Exports the trained NeRF into a 3D mesh. Public signature UNCHANGED.
+
+    Windows patches: WinError 87 + PyTorch 2.6 preserved via build_nerf_runner.
+    """
+    output_dir_p = Path(output_dir)
+
+    # [IDEMPOTENCY] Check for any .ply in output dir
+    if not force_recompute and output_dir_p.exists():
+        existing_ply = list(output_dir_p.glob("*.ply"))
+        if existing_ply:
+            logger.info(f"Mesh already exists: {existing_ply[0]}. Skipping.")
+            return
+
+    output_dir_p.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Exporting 3D mesh ({method}) → {output_dir_p}")
+
+    runner = build_nerf_runner(
+        "from nerfstudio.scripts.exporter import entrypoint",
+        include_mediapy=False,
     )
-    
-    wrapper_cmd = ["python", "-c", runner] + cmd
-    
-    try:
-        subprocess.run(wrapper_cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Error during {desc}: {e}")
-        exit(1)
-
-def export_3d_mesh(config_path: str, output_dir: str, method: str = "tsdf"):
-    """
-    Exports the trained NeRF into a standard 3D Mesh geometry (.ply / .obj).
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
     cmd = [
+        "python", "-c", runner,
         "ns-export", method,
         "--load-config", config_path,
-        "--output-dir", output_dir
+        "--output-dir", output_dir,
     ]
-    
-    run_cmd(cmd, f"3D Mesh Export ({method})")
+
+    with phase_timer(logger, f"3D Mesh Export ({method})"):
+        run_cmd(cmd, f"3D Mesh Export ({method})")
+
+    logger.info(f"✅ Mesh exported → {output_dir_p}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Export a 3D mesh from a trained NeRF model.")
-    parser.add_argument("--config", required=True, help="Path to the trained model's config.yml")
-    parser.add_argument("--output_dir", required=True, help="Directory to save the exported mesh")
-    parser.add_argument("--method", type=str, default="tsdf", choices=["tsdf", "poisson"], help="Meshing algorithm to use")
-    
+    parser = argparse.ArgumentParser(description="Export a 3D mesh from a trained NeRF.")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--method", type=str, default="tsdf", choices=["tsdf", "poisson"])
+    parser.add_argument("--force_recompute", action="store_true")
     args = parser.parse_args()
-    export_3d_mesh(args.config, args.output_dir, args.method)
+    export_3d_mesh(args.config, args.output_dir, args.method, args.force_recompute)

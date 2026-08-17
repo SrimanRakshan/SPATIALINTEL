@@ -1,73 +1,75 @@
-import os
+"""
+Evaluation — NeRF Video Rendering.
+
+Execution guarantees:
+  [IDEMPOTENCY]  Skips if output video already exists unless --force_recompute.
+  [OBSERVABILITY] Structured logger + phase_timer.
+  [SAFETY]       Windows patches preserved via build_nerf_runner.
+"""
+from __future__ import annotations
+
 import argparse
-import subprocess
+import sys
 from pathlib import Path
 
-def run_cmd(cmd: list, desc: str):
-    print(f"\n--- {desc} ---")
-    print(f"Running: {' '.join(cmd)}")
-    
-def run_cmd(cmd: list, desc: str):
-    print(f"\n--- {desc} ---")
-    print(f"Running: {' '.join(cmd)}")
-    
-    runner = (
-        "import sys, torch, warnings, os, subprocess; "
-        "old_popen = subprocess.Popen; "
-        "subprocess.Popen = lambda *a, **k: old_popen(*a, **{**k, 'env': None} if k.get('env') == {} else k); "
-        "os.environ['TORCH_FORCE_WEIGHTS_ONLY_LOAD'] = '0'; "
-        "sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None; "
-        "warnings.filterwarnings('ignore', category=FutureWarning); "
-        "_old_load = torch.load; "
-        "torch.load = lambda *a, **k: _old_load(*a, **{**k, 'weights_only': False}); "
-        "import mediapy; mediapy.set_ffmpeg(r'C:\\ffmpeg\\bin\\ffmpeg.exe'); "
-        "from nerfstudio.scripts.render import entrypoint; "
-        "sys.argv=sys.argv[1:]; "
-        "entrypoint()"
-    )
-    
-    wrapper_cmd = ["python", "-c", runner] + cmd
-    
-    try:
-        subprocess.run(wrapper_cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Error during {desc}: {e}")
-        exit(1)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.subprocess_runner import build_nerf_runner, run_cmd
+from utils.logger import get_logger, phase_timer
+from utils.validators import check_output_exists
 
-def export_video(config_path: str, output_path: str, trajectory_type: str = "interpolate"):
+logger = get_logger("evaluation.render_video")
+
+
+def export_video(
+    config_path: str,
+    output_path: str,
+    trajectory_type: str = "interpolate",
+    force_recompute: bool = False,
+) -> None:
     """
-    Renders a 360-degree high-resolution video of the reconstructed scene.
-    By default, computes a smooth spiral or interpolation path around the object.
+    Renders a 360-degree NeRF video. Public signature UNCHANGED.
+
+    Windows patches: WinError 87 + PyTorch 2.6 weights_only preserved
+    inside build_nerf_runner() → src/utils/subprocess_runner.py.
     """
-    config_path = Path(config_path)
-    output_path = Path(output_path)
-    
-    if not config_path.exists():
-        print(f"Error: Could not find training config at {config_path}")
-        exit(1)
-        
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    print("\nRendering high-resolution 360-degree video...")
-    print("This will compute novel views along the camera trajectory.")
-    
-    cmd1 = [
+    config_path_p = Path(config_path)
+    output_path_p = Path(output_path)
+
+    # [IDEMPOTENCY]
+    if not force_recompute and check_output_exists(output_path_p):
+        logger.info(f"Output already exists: {output_path_p}. Skipping.")
+        return
+
+    if not config_path_p.exists():
+        logger.error(f"Config not found: {config_path_p}")
+        logger.error("Hint: Run Phase 3 (run_nerf.py --train) first.")
+        raise SystemExit(1)
+
+    output_path_p.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Rendering {trajectory_type} trajectory → {output_path_p}")
+
+    runner = build_nerf_runner(
+        "from nerfstudio.scripts.render import entrypoint",
+        include_mediapy=True,
+    )
+    cmd = [
+        "python", "-c", runner,
         "ns-render", trajectory_type,
-        "--load-config", str(config_path),
-        "--output-path", str(output_path)
+        "--load-config", str(config_path_p),
+        "--output-path", str(output_path_p),
     ]
-    
-    # Depending on NeRF memory, 1080p rendering may OOM directly. 
-    # If so, ns-render internally batches the rays.
-    run_cmd(cmd1, "Video Rendering")
-    
-    print(f"\nVideo successfully saved to: {output_path}")
+
+    with phase_timer(logger, "Video Rendering"):
+        run_cmd(cmd, "Video Rendering")
+
+    logger.info(f"✅ Video saved → {output_path_p}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Render a 360 trajectory video from a trained NeRF model.")
-    parser.add_argument("--config", required=True, help="Path to the trained model's config.yml")
-    parser.add_argument("--output", required=True, help="Path to the output MP4 video file")
-    parser.add_argument("--trajectory", type=str, default="interpolate", choices=["spiral", "interpolate"], help="Type of camera path")
-    
+    parser = argparse.ArgumentParser(description="Render a 360 trajectory video from a trained NeRF.")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--trajectory", type=str, default="interpolate", choices=["spiral", "interpolate"])
+    parser.add_argument("--force_recompute", action="store_true")
     args = parser.parse_args()
-    export_video(args.config, args.output, args.trajectory)
+    export_video(args.config, args.output, args.trajectory, args.force_recompute)

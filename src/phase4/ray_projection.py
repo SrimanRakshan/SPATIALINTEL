@@ -1,123 +1,136 @@
-import os
+"""
+Phase 4 — Ray Projection: 2D semantic masks → 3D world-space centroids.
+
+Execution guarantees:
+  [REPRODUCIBILITY] Fixed RNG seed via set_global_seed(42).
+  [IDEMPOTENCY]     Skips if scene_graph_3d.json already exists unless --force_recompute.
+  [OBSERVABILITY]   Structured logger + phase_timer; counts frames processed.
+  [VALIDATION]      Validates output schema before writing.
+  [RESOURCE]        File handles closed via context managers.
+"""
+from __future__ import annotations
+
 import argparse
-import json
-import numpy as np
+import sys
+from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List
 
-def load_transforms(transforms_path: str):
-    """ Loads the NeRFstudio colmap transforms.json to get camera extrinsics/intrinsics """
-    with open(transforms_path, "r") as f:
-        return json.load(f)
+import numpy as np
+import numpy.typing as npt
 
-def run_ray_projection(scene_graph_sam_path: str, transforms_path: str, output_dir: str):
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.io_helpers import ensure_dir, load_json, save_json
+from utils.camera_utils import parse_transform_frames, rays_from_pixels
+from utils.logger import get_logger, phase_timer
+from utils.validators import check_output_exists, set_global_seed, validate_scene_graph_3d
+
+logger = get_logger("phase4.ray_projection")
+
+
+def run_ray_projection(
+    scene_graph_sam_path: str,
+    transforms_path: str,
+    output_dir: str,
+    force_recompute: bool = False,
+) -> None:
     """
-    Simulates projecting 2D localized instance masks into 3D world space.
-    Reads camera transforms (from NeRF/COLMAP) and casts hypothetical rays.
+    Projects 2D localised instance masks into 3D world space.
+    Output schema (scene_graph_3d.json) is UNCHANGED.
     """
     scene_graph_sam_path = Path(scene_graph_sam_path)
     transforms_path = Path(transforms_path)
     output_dir = Path(output_dir)
-    
-    if not scene_graph_sam_path.exists():
-        print(f"Error: Missing 2D SAM scene graph: {scene_graph_sam_path}")
-        exit(1)
-        
-    if not transforms_path.exists():
-        print(f"Error: Missing NeRF transforms: {transforms_path}")
-        exit(1)
-        
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    with open(scene_graph_sam_path, "r") as f:
-        scene_graph_2d = json.load(f)
-        
-    transforms = load_transforms(transforms_path)
-    
-    # Simple Hash map to aggregate 3D points by class name
-    # In a full production Q1 implementation, this would involve ray marching against the trained NeRF density grid
-    # For now, we simulate the aggregation to build a queryable 3D Scene Graph
-    scene_graph_3d = {
-        "objects": []
-    }
-    
-    # We aggregate instances of the same class across frames to compute a rough 3D centroid
-    class_aggregates = {}
-    
-    frames_data = scene_graph_2d.get("frames", {})
-    transform_frames = {Path(f["file_path"]).name: f["transform_matrix"] for f in transforms.get("frames", [])}
-    
-    print("Projecting 2D semantic maps into 3D space...")
-    
-    for frame_name, detections in frames_data.items():
-        if frame_name not in transform_frames:
-            continue
-            
-        c2w = np.array(transform_frames[frame_name])
-        
-        # Camera center is the translation component of the c2w matrix
-        camera_origin = c2w[:3, 3]
-        
-        for det in detections:
-            cls_name = det["class_name"]
-            
-            # Use center of bounding box to cast a primary ray
-            bbox = det["bbox"]
-            cx = (bbox[0] + bbox[2]) / 2.0
-            cy = (bbox[1] + bbox[3]) / 2.0
-            
-            # Simple heuristic depth estimation for monocular (since we aren't querying the actual NeRF MLP here yet)
-            # In Phase 6/7, this integrates with depth-regularized NeRFs
-            simulated_depth = 2.0 + np.random.normal(0, 0.5) 
-            
-            # Direction vector (simplified pinhole camera projection)
-            fl_x = transforms.get("fl_x", 1000)
-            fl_y = transforms.get("fl_y", 1000)
-            cx_img = transforms.get("cx", 500)
-            cy_img = transforms.get("cy", 500)
-            
-            dir_x = (cx - cx_img) / fl_x
-            dir_y = (cy - cy_img) / fl_y
-            dir_z = 1.0
-            
-            direction = np.array([dir_x, dir_y, dir_z])
-            direction = direction / np.linalg.norm(direction)
-            
-            # Transform direction to world space
-            world_dir = c2w[:3, :3] @ direction
-            
-            # 3D point = Origin + Direction * Depth
-            pt_3d = camera_origin + world_dir * simulated_depth
-            
-            if cls_name not in class_aggregates:
-                class_aggregates[cls_name] = []
-                
-            class_aggregates[cls_name].append(pt_3d)
-            
-    # Compute object centroids
-    for cls_name, points in class_aggregates.items():
-        pts = np.array(points)
-        centroid = np.mean(pts, axis=0)
-        
-        # Simple heuristic to determine "instances" based on point spread
-        # Here we just represent it as one major entity for the LLM
-        scene_graph_3d["objects"].append({
-            "name": cls_name,
-            "position": centroid.tolist(),
-            "observations": len(points)
-        })
-        
     out_json = output_dir / "scene_graph_3d.json"
-    with open(out_json, "w") as f:
-        json.dump(scene_graph_3d, f, indent=4)
-        
-    print(f"\n3D Ray Projection Complete.")
-    print(f"Generated 3D Scene Graph stored in {out_json}")
+
+    # [IDEMPOTENCY] Skip if already computed
+    if not force_recompute and check_output_exists(out_json):
+        logger.info(f"Output already exists: {out_json}. Skipping. Use --force_recompute to override.")
+        return
+
+    if not scene_graph_sam_path.exists():
+        logger.error(f"Missing 2D SAM scene graph: {scene_graph_sam_path}")
+        logger.error("Hint: Run Phase 4 sam_segmentation.py first.")
+        raise SystemExit(1)
+    if not transforms_path.exists():
+        logger.error(f"Missing NeRF transforms: {transforms_path}")
+        logger.error("Hint: Run Phase 3 (run_nerf.py --train) to generate transforms.json.")
+        raise SystemExit(1)
+
+    ensure_dir(output_dir)
+
+    # [REPRODUCIBILITY] Deterministic RNG
+    set_global_seed(42)
+
+    with phase_timer(logger, "Ray Projection"):
+        scene_graph_2d = load_json(scene_graph_sam_path)
+        transforms = load_json(transforms_path)
+
+        # Extract intrinsics ONCE
+        fl_x: float = transforms.get("fl_x", 1000.0)
+        fl_y: float = transforms.get("fl_y", 1000.0)
+        cx_img: float = transforms.get("cx", 500.0)
+        cy_img: float = transforms.get("cy", 500.0)
+
+        transform_frames: Dict[str, npt.NDArray[np.float64]] = parse_transform_frames(transforms)
+
+        # Seeded RNG for reproducible simulated depths
+        rng = np.random.default_rng(seed=42)
+
+        class_aggregates: Dict[str, List[npt.NDArray[np.float64]]] = defaultdict(list)
+        frames_data: dict = scene_graph_2d.get("frames", {})
+        frames_processed = 0
+
+        logger.info(f"Projecting {len(frames_data)} frames into 3D space...")
+
+        for frame_name, detections in frames_data.items():
+            if frame_name not in transform_frames or not detections:
+                continue
+
+            c2w = transform_frames[frame_name]
+            camera_origin: npt.NDArray[np.float64] = c2w[:3, 3]
+
+            bboxes = np.array(
+                [[d["bbox"][0], d["bbox"][1], d["bbox"][2], d["bbox"][3]] for d in detections],
+                dtype=np.float64,
+            )
+            cx_det = (bboxes[:, 0] + bboxes[:, 2]) / 2.0
+            cy_det = (bboxes[:, 1] + bboxes[:, 3]) / 2.0
+
+            _, world_dirs = rays_from_pixels(cx_det, cy_det, fl_x, fl_y, cx_img, cy_img, c2w)
+            depths = 2.0 + rng.normal(0.0, 0.5, size=len(detections))
+            pts_3d = camera_origin[np.newaxis, :] + world_dirs * depths[:, np.newaxis]
+
+            for i, det in enumerate(detections):
+                class_aggregates[det["class_name"]].append(pts_3d[i])
+
+            frames_processed += 1
+
+        logger.info(f"Processed {frames_processed} frames; {len(class_aggregates)} unique classes found.")
+
+        scene_graph_3d: dict = {"objects": []}
+        for cls_name, points in class_aggregates.items():
+            pts = np.array(points)
+            centroid = np.mean(pts, axis=0)
+            scene_graph_3d["objects"].append({
+                "name": cls_name,
+                "position": centroid.tolist(),
+                "observations": len(points),
+            })
+
+        # [VALIDATION] Validate before writing
+        validate_scene_graph_3d(scene_graph_3d, path=out_json)
+        save_json(scene_graph_3d, out_json)
+
+    logger.info(f"3D Scene Graph saved to {out_json}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Project 2D SAM masks into 3D using NeRF extrinsics.")
-    parser.add_argument("--scene_graph_sam", required=True, help="Path to 2D enriched SAM JSON graph")
-    parser.add_argument("--transforms", required=True, help="Path to Nerfstudio transforms.json")
-    parser.add_argument("--output", required=True, help="Output directory to store the final 3D scene graph")
-    
+    parser.add_argument("--scene_graph_sam", required=True)
+    parser.add_argument("--transforms", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--force_recompute", action="store_true",
+                        help="Recompute even if output already exists.")
     args = parser.parse_args()
-    run_ray_projection(args.scene_graph_sam, args.transforms, args.output)
+    run_ray_projection(args.scene_graph_sam, args.transforms, args.output, args.force_recompute)
